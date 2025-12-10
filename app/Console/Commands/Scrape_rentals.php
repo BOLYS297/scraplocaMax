@@ -7,6 +7,7 @@ use Spatie\Browsershot\Browsershot;
 use Symfony\Component\DomCrawler\Crawler;
 use App\Models\rental_sources as RentalSource;
 use Illuminate\Support\Str;
+use Illuminate\Support\Facades\DB;
 
 class Scrape_rentals extends Command
 {
@@ -14,34 +15,42 @@ class Scrape_rentals extends Command
         {startUrl : URL de départ}
         {--max-pages=200 : nombre max de pages à visiter}
         {--max-depth=3 : profondeur max de crawl}
-        {--delay=1000 : délai entre requêtes en ms}';
+        {--delay=800 : délai entre requêtes en ms}
+        {--browser-path=null : chemin vers binaire du navigateur (override .env)}
+        {--no-sandbox=true : activer --no-sandbox (true/false)}
+        {--user-agent=null : User-Agent à utiliser (override .env)}';
 
-    protected $description = 'Crawl un site web à partir d\'une URL donnée, extrait les annonces de locations et les stocke en base de données.';
+    protected $description = 'Crawl un site de locations et extrait les sources de locations (agences, particuliers)';
 
-    // runtime state
+    // runtime
     protected array $visited = [];
     protected int $processed = 0;
+    protected int $saved = 0;
 
     public function handle()
     {
         $startUrl = $this->argument('startUrl');
-        $maxPages = (int) $this->option('max-pages');
-        $maxDepth = (int) $this->option('max-depth');
-        $delayMs = (int) $this->option('delay');
+        $maxPages = (int)$this->option('max-pages');
+        $maxDepth = (int)$this->option('max-depth');
+        $delayMs = (int)$this->option('delay');
 
-        // normaliser url de départ
+        $envBrowserPath = env('BROWSER_PATH', 'C:\Program Files\Google\Chrome\Application\chrome.exe');
+        $browserPath = $this->option('browser-path') !== 'null' ? $this->option('browser-path') : $envBrowserPath;
+        $noSandboxOpt = $this->option('no-sandbox') === 'true' || (string)env('BROWSERSHOT_NO_SANDBOX', 'true') === 'true';
+        $envUA = env('SCRAPER_USER_AGENT', null);
+        $userAgent = $this->option('user-agent') !== 'null' ? $this->option('user-agent') : ($envUA ?? 'Mozilla/5.0 (compatible; ScrapBot/1.0)');
+
         $startUrl = $this->normalizeUrl($startUrl);
         $homeHost = parse_url($startUrl, PHP_URL_HOST);
 
-        $this->info("Début du crawl à partir de : $startUrl");
+        $this->info("Crawl démarré → $startUrl");
         $this->info("Domaine autorisé : $homeHost");
-        $this->info("Max pages: $maxPages | Max depth: $maxDepth | Delay: {$delayMs}ms");
+        $this->info("MaxPages: $maxPages | MaxDepth: $maxDepth | Delay: {$delayMs}ms | BrowserPath: $browserPath");
 
-        // queue d'urls: chaque item = ['url'=>..., 'depth'=>int]
         $queue = new \SplQueue();
         $queue->enqueue(['url' => $startUrl, 'depth' => 0]);
 
-        // preparer progressbar
+        // progressbar max = maxPages (s'affiche dans CMD)
         $bar = $this->output->createProgressBar($maxPages);
         $bar->start();
 
@@ -50,107 +59,150 @@ class Scrape_rentals extends Command
             $url = $item['url'];
             $depth = $item['depth'];
 
-            // skip si déjà visité
+            // normalize absolute url
+            $url = $this->normalizeUrl($url, $startUrl);
+
             if (isset($this->visited[$url])) {
                 continue;
             }
 
-            // marque comme visité
+            // mark visited
             $this->visited[$url] = true;
 
-            // log
-            $this->info("\nVisite #".($this->processed+1)." → $url (depth: $depth)");
+            $this->info("\nVisite #".($this->processed + 1)." → $url (depth: $depth)");
 
-            // Charger page via Browsershot (retry avec noSandbox si plantage)
+            // load html with Browsershot
             try {
-                $html = $this->loadPageHtml($url, $delayMs);
+                $html = $this->loadPageHtml(
+                    $url,
+                    $browserPath,
+                    $noSandboxOpt,
+                    $userAgent,
+                    $delayMs
+                );
             } catch (\Throwable $e) {
-                $this->error("Erreur chargement $url : ".$e->getMessage());
+                $this->error("Erreur chargement $url : " . $e->getMessage());
                 $bar->advance();
                 $this->processed++;
-                // continuer
+                // Wait polite delay
+                usleep($delayMs * 1000);
                 continue;
             }
 
-            // parse
+            // parse with Crawler
             $crawler = new Crawler($html, $url);
 
-            // 1) Extraction directe d'éventuelles annonces sur la page
+            // extract items on this page (listings or single)
             $items = $this->extractItemsFromPage($crawler, $url);
 
             $this->info(" → ".count($items)." item(s) extraits sur la page");
 
-            // sauvegarde en base
+            // save items (transaction per item to avoid partial failure)
             foreach ($items as $i) {
-                // remplir tous les champs demandés (assurez-vous que city soit défini)
+                // guarantee minimal city
                 $city = $i['city'] ?? 'Unknown';
-                RentalSource::updateOrCreate(
-                    ['source_url' => $i['url'] ?? $url],
-                    [
-                        'source_type' => $i['source_type'] ?? $this->guessSourceType($i),
-                        'name_or_title' => $i['title'] ?? ($i['name'] ?? 'N/A'),
-                        'phone_number' => $i['phone'] ?? null,
-                        'email' => $i['email'] ?? null,
-                        'property_type' => $i['property_type'] ?? null,
-                        'city' => $city,
-                        'district' => $i['district'] ?? null,
-                        'is_qualified' => !empty($i['phone']),
-                    ]
-                );
+
+                try {
+                    DB::transaction(function () use ($i, $url, $city) {
+                        $srcUrl = $i['url'] ?? $url;
+
+                        $entry = RentalSource::updateOrCreate(
+                            ['source_url' => $srcUrl],
+                            [
+                                'source_type' => $i['source_type'] ?? $this->guessSourceType($i),
+                                'name_or_title' => $i['title'] ?? ($i['name'] ?? 'N/A'),
+                                'phone_number' => $this->cleanPhone($i['phone'] ?? null),
+                                'email' => $i['email'] ?? null,
+                                'property_type' => $i['property_type'] ?? null,
+                                'city' => $city,
+                                'district' => $i['district'] ?? null,
+                                'is_qualified' => !empty($i['phone']),
+                            ]
+                        );
+
+                        if ($entry->wasRecentlyCreated) {
+                            $this->saved++;
+                        }
+                    });
+                } catch (\Throwable $e) {
+                    $this->error("Erreur sauvegarde item: " . $e->getMessage());
+                }
             }
 
-            // 2) Si profondeur autorisée, trouver les liens pour enqueuer
+            // if depth allowed, enqueue internal links
             if ($depth < $maxDepth) {
-                $links = $this->extractLinks($crawler, $homeHost);
-                $this->info(" → ".count($links)." lien(s) internes trouvés sur la page");
+                $links = $this->extractLinks($crawler);
+                $this->info(" → ".count($links)." lien(s) trouvés sur la page");
 
                 foreach ($links as $link) {
                     $norm = $this->normalizeUrl($link, $url);
-                    // conditions d'ajout : même domaine et non visité et pas de fragment
-                    if ($this->isSameDomain($norm, $homeHost) && !isset($this->visited[$norm])) {
-                        // éviter les ressources non-HTML (pdf, jpg, etc)
-                        if ($this->looksLikeHtml($norm)) {
-                            $queue->enqueue(['url' => $norm, 'depth' => $depth + 1]);
-                        }
+                    if ($this->isSameDomain($norm, $homeHost) && !$this->looksLikeResource($norm) && !isset($this->visited[$norm])) {
+                        $queue->enqueue(['url' => $norm, 'depth' => $depth + 1]);
                     }
                 }
             }
 
-            // avancement
             $bar->advance();
             $this->processed++;
 
-            // délai pour être poli
+            // polite delay (prevent DDOS)
             usleep($delayMs * 1000);
         }
 
         $bar->finish();
         $this->newLine();
-        $this->info("Crawl terminé. Pages traitées : {$this->processed}. Entrées en base: ".RentalSource::count());
+        $this->info("Crawl terminé. Pages traitées: {$this->processed}. Nouveaux enregistrements: {$this->saved}.");
+        $this->info("Total en base: " . RentalSource::count());
+
         return 0;
     }
 
     /**
-     * Utilise Browsershot pour récupérer le HTML rendu.
-     * Si échec, retente en activant noSandbox().
+     * Charge une page via Browsershot (avec fallback noSandbox).
      */
-    protected function loadPageHtml(string $url, int $delayMs): string
+    protected function loadPageHtml(string $url, string $browserPath, bool $noSandbox, string $userAgent, int $delayMs): string
     {
+        $baseOptions = [
+            '--window-size=1280,900',
+            '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--disable-gpu',
+        ];
+
+        if ($noSandbox) {
+            $baseOptions[] = '--no-sandbox';
+            $baseOptions[] = '--disable-setuid-sandbox';
+        }
+
+        // option to set custom user agent and args
         try {
             $bs = Browsershot::url($url)
+                ->setOption('args', $baseOptions)
+                ->setChromePath($browserPath)
+                ->setUserAgent($userAgent)
                 ->waitUntilNetworkIdle()
-                ->setDelay(max(500, $delayMs)) // attendre JS
-                ->timeout(60000) // ms
+                ->setDelay(max(500, $delayMs))
+                ->timeout(60000)
                 ->windowSize(1280, 900);
+
+            // get HTML final
             return $bs->bodyHtml();
         } catch (\Throwable $e) {
-            // essai de secours (noSandbox)
+            // fallback: try with noSandbox forced
             try {
+                $fallbackArgs = $baseOptions;
+                if (!in_array('--no-sandbox', $fallbackArgs)) {
+                    $fallbackArgs[] = '--no-sandbox';
+                    $fallbackArgs[] = '--disable-setuid-sandbox';
+                }
                 return Browsershot::url($url)
+                    ->setOption('args', $fallbackArgs)
+                    ->setChromePath($browserPath)
+                    ->setUserAgent($userAgent)
                     ->noSandbox()
                     ->waitUntilNetworkIdle()
                     ->setDelay(max(500, $delayMs))
-                    ->timeout(60000)
+                    ->timeout(90000)
                     ->windowSize(1280, 900)
                     ->bodyHtml();
             } catch (\Throwable $e2) {
@@ -160,47 +212,44 @@ class Scrape_rentals extends Command
     }
 
     /**
-     * Extrait les "items" (annonces / sources) depuis le HTML.
-     * Utilise heuristiques : cherche éléments typiques (.annonce, .listing, article, .card)
-     * Retourne un tableau d'items : ['title','phone','email','city','url',...]
+     * Extrait items depuis une page : tente de trouver des listings (blocs) sinon tente d'extraire la page comme fiche unique.
      */
     protected function extractItemsFromPage(Crawler $crawler, string $baseUrl): array
     {
         $candidates = [];
 
-        // 1) Si la page a des blocs d'annonce identifiables
-        $selectors = ['.annonce', '.listing', '.item', '.card', 'article', '.property', '.result'];
-        foreach ($selectors as $sel) {
-            $nodes = $crawler->filter($sel);
-            if ($nodes->count() > 0) {
-                foreach ($nodes as $node) {
-                    $nodeCrawler = new Crawler($node, $baseUrl);
-                    $title = $this->tryText($nodeCrawler, ['.titre', '.title', 'h2', 'h3', '.name']);
-                    $phone = $this->tryText($nodeCrawler, ['.tel', '.phone', '.contact', '.telephone']);
-                    $email = $this->tryText($nodeCrawler, ['a[href^="mailto:"]']) ?? $this->extractEmail($nodeCrawler->html());
-                    $city = $this->tryText($nodeCrawler, ['.city', '.ville', '.location']) ?? $this->extractCityFromText($nodeCrawler->text());
-                    $url = $this->tryAttr($nodeCrawler, ['a'], 'href') ? $this->normalizeUrl($this->tryAttr($nodeCrawler, ['a'], 'href'), $baseUrl) : $baseUrl;
-                    $propertyType = $this->tryText($nodeCrawler, ['.type', '.property-type']);
-                    $district = $this->tryText($nodeCrawler, ['.district', '.quartier']);
+        // selectors probables pour listes
+        $listSelectors = ['.annonce', '.listing', '.item', '.card', 'article', '.property', '.result', '.offer', '.listing-item'];
+
+        foreach ($listSelectors as $sel) {
+            if ($crawler->filter($sel)->count() > 0) {
+                $crawler->filter($sel)->each(function (Crawler $node) use (&$candidates, $baseUrl) {
+                    $title = $this->tryText($node, ['.titre', '.title', 'h2', 'h3', '.name', '.offer-title']);
+                    $phone = $this->tryText($node, ['.tel', '.phone', '.contact', '.telephone']);
+                    $email = $this->tryAttr($node, ['a[href^="mailto:"]'], 'href') ? $this->stripMailto($this->tryAttr($node, ['a[href^="mailto:"]'], 'href')) : $this->extractEmail($node->html());
+                    $city = $this->tryText($node, ['.city', '.ville', '.location', '.place']) ?? $this->extractCityFromText($node->text());
+                    $url = $this->tryAttr($node, ['a'], 'href') ? $this->normalizeUrl($this->tryAttr($node, ['a'], 'href'), $baseUrl) : $baseUrl;
+                    $propertyType = $this->tryText($node, ['.type', '.property-type']);
+                    $district = $this->tryText($node, ['.district', '.quartier']);
 
                     $candidates[] = [
                         'title' => $title,
-                        'phone' => $this->cleanPhone($phone),
+                        'phone' => $phone ? $this->cleanPhone($phone) : null,
                         'email' => $email,
                         'city' => $city,
                         'url' => $url,
                         'property_type' => $propertyType,
                         'district' => $district,
                     ];
-                }
-                // si on a trouvé sur ce selecteur, on peut retourner ces candidats
+                });
+
                 if (!empty($candidates)) {
                     return $candidates;
                 }
             }
         }
 
-        // 2) Sinon, la page peut être une fiche détail -> extraire "page entière"
+        // fallback : attempt page-level extraction
         $pageText = $crawler->filter('body')->count() ? $crawler->filter('body')->text() : $crawler->html();
         $phone = $this->extractPhone($pageText);
         $email = $this->extractEmail($pageText);
@@ -209,7 +258,6 @@ class Scrape_rentals extends Command
         $propertyType = $this->guessPropertyTypeFromText($pageText);
         $district = $this->extractDistrictFromText($pageText);
 
-        // if we found anything at page level, return single item
         if ($title || $phone || $email) {
             return [[
                 'title' => $title ?? 'N/A',
@@ -222,8 +270,10 @@ class Scrape_rentals extends Command
             ]];
         }
 
-        return []; // rien d'extrait
+        return [];
     }
+
+    // -------------------- helpers --------------------
 
     protected function tryText(Crawler $c, array $selectors)
     {
@@ -234,7 +284,7 @@ class Scrape_rentals extends Command
                     $t = trim($node->first()->text(null));
                     if ($t !== '') return $t;
                 }
-            } catch (\Exception $e) { /* ignore */ }
+            } catch (\Throwable $e) { /* ignore */ }
         }
         return null;
     }
@@ -247,60 +297,63 @@ class Scrape_rentals extends Command
                 if ($node->count() && $node->first()->attr($attr)) {
                     return trim($node->first()->attr($attr));
                 }
-            } catch (\Exception $e) { /* ignore */ }
+            } catch (\Throwable $e) { /* ignore */ }
         }
         return null;
     }
 
-    protected function extractLinks(Crawler $crawler, string $homeHost): array
+    protected function stripMailto($val)
     {
-        $links = [];
-        foreach ($crawler->filter('a') as $a) {
-            $href = $a->getAttribute('href');
-            if (!$href) continue;
-            // skip javascript: links, mailto, tel
-            if (Str::startsWith($href, ['#','javascript:','mailto:','tel:'])) continue;
-            $links[] = $href;
-        }
-        // unique
-        return array_values(array_unique($links));
+        if (!$val) return null;
+        return preg_replace('/^mailto:/i','',$val);
     }
 
-    // ---------- Helpers & heuristics ----------
+    protected function extractLinks(Crawler $crawler): array
+    {
+        $links = $crawler->filter('a')->each(function (Crawler $node) {
+            return $node->attr('href');
+        });
+
+        $out = [];
+        foreach ($links as $href) {
+            if (!$href) continue;
+            if (Str::startsWith($href, ['#','javascript:','mailto:','tel:'])) continue;
+            $out[] = $href;
+        }
+        return array_values(array_unique($out));
+    }
 
     protected function normalizeUrl(string $url, ?string $base = null): string
     {
-        // si url relative, construire absolute à partir de base
-        if ($base && !Str::startsWith($url, ['http://', 'https://'])) {
-            // gérer protocol-relative //domain/path
+        $url = trim($url);
+        if ($base && !Str::startsWith($url, ['http://','https://'])) {
             if (Str::startsWith($url, '//')) {
                 $scheme = parse_url($base, PHP_URL_SCHEME) ?: 'https';
                 return $scheme . ':' . $url;
             }
-            // path-relative
-            return rtrim($base, '/') . '/' . ltrim($url, '/');
+            // relative path
+            $base = rtrim($base, '/');
+            return $base . '/' . ltrim($url, '/');
         }
         return $url;
     }
 
     protected function isSameDomain(string $url, string $homeHost): bool
     {
-        $h = parse_url($url, PHP_URL_HOST);
+        $h = parse_url($url, PHP_URL_HOST) ?: '';
         return $h === $homeHost || str_ends_with($h, '.'.$homeHost);
     }
 
-    protected function looksLikeHtml(string $url): bool
+    protected function looksLikeResource(string $url): bool
     {
-        // exclude common non-html extensions
-        $no = ['.jpg','.jpeg','.png','.gif','.svg','.webp','.pdf','.zip','.rar','.mp4','.mp3'];
-        foreach ($no as $ext) if (Str::endsWith(strtolower($url), $ext)) return false;
-        return true;
+        $no = ['.jpg','.jpeg','.png','.gif','.svg','.webp','.pdf','.zip','.rar','.mp4','.mp3','.css','.js'];
+        foreach ($no as $ext) if (Str::endsWith(strtolower($url), $ext)) return true;
+        return false;
     }
 
-    protected function extractPhone(?string $text = null): ?string
+    protected function extractPhone(?string $text = null) : ?string
     {
         if (!$text) return null;
-        // regex simple: captures +xxx ... numbers with spaces/dashes
         if (preg_match('/(\+?\d[\d\-\s]{6,}\d)/', $text, $m)) {
             return trim($m[1]);
         }
@@ -310,14 +363,12 @@ class Scrape_rentals extends Command
     protected function cleanPhone($phone)
     {
         if (!$phone) return null;
-        // keep digits and plus
         $clean = preg_replace('/[^\d+]/','',$phone);
-        // basic validation
         if (strlen(preg_replace('/\D/','',$clean)) < 6) return null;
         return $clean;
     }
 
-    protected function extractEmail(?string $text = null): ?string
+    protected function extractEmail(?string $text = null) : ?string
     {
         if (!$text) return null;
         if (preg_match('/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i', $text, $m)) {
@@ -331,22 +382,21 @@ class Scrape_rentals extends Command
         try {
             $t = $c->filter('meta[property="og:title"]')->first()->attr('content') ?? null;
             if ($t) return trim($t);
-        } catch (\Exception $e) {}
+        } catch (\Throwable $e) {}
         try {
             $t = $c->filter('title')->first()->text();
             if ($t) return trim($t);
-        } catch (\Exception $e) {}
+        } catch (\Throwable $e) {}
         return null;
     }
 
     protected function extractTitleFromCrawler(Crawler $c)
     {
-        return $this->tryText($c, ['h1', 'h2', '.title', '.heading', '.post-title']);
+        return $this->tryText($c, ['h1','h2','.title','.heading','.post-title']);
     }
 
     protected function extractCityFromText(string $text)
     {
-        // heuristique simple: chercher mots-clés de villes fréquentes ou "Ville: X"
         if (preg_match('/Ville[:\s]+([A-Za-zÀ-ÿ\-\']{2,})/i', $text, $m)) return trim($m[1]);
         if (preg_match('/(Douala|Yaounde|Yaoundé|Lagos|Abidjan|Bamako|Dakar)/i', $text, $m)) return trim($m[1]);
         return null;
@@ -362,29 +412,16 @@ class Scrape_rentals extends Command
 
     protected function guessPropertyTypeFromText(string $text)
     {
-        $keywords = [
-            'apartment'=>'Apartment',
-            'appartement'=>'Appartement',
-            'maison'=>'Maison',
-            'studio'=>'Studio',
-            'chambre'=>'Chambre',
-            'villa'=>'Villa'
-        ];
+        $keywords = ['apartment'=>'Apartment','appartement'=>'Appartement','maison'=>'Maison','studio'=>'Studio','chambre'=>'Chambre','villa'=>'Villa'];
         foreach ($keywords as $k=>$v) {
             if (stripos($text, $k) !== false) return $v;
         }
         return null;
     }
 
-    protected function tryTextOrNull($node)
-    {
-        try { return trim($node->text(null)); } catch (\Exception $e) { return null; }
-    }
-
     protected function guessSourceType(array $item)
     {
-        // heuristique : si le texte contient 'agence' -> AGENCY, sinon PRIVATE
-        $hay = strtolower( ($item['title'] ?? '') . ' ' . ($item['property_type'] ?? '') );
+        $hay = strtolower(($item['title'] ?? '') . ' ' . ($item['property_type'] ?? ''));
         if (str_contains($hay, 'agence') || str_contains($hay, 'agency') || str_contains($hay, 'immobili')) {
             return 'AGENCY';
         }

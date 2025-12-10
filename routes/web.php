@@ -6,7 +6,7 @@ use App\Http\Controllers\RentalSourceController;
 
 
 Route::get('/', function () {
-    return view('rental_sources');
+    return redirect()->route('rental.sources.index');
 });
 
 

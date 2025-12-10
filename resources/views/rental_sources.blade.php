@@ -19,9 +19,9 @@
 </head>
 <body>
 
-<h1>📌 Résultats du Scraping</h1>
+<h1> Résultats du Scraping</h1>
 
-{{-- 🔎 FILTRE PAR VILLE --}}
+{{--  FILTRE PAR VILLE --}}
 <form method="GET" class="filter-box">
     <label>Filtrer par ville :</label>
 
@@ -39,7 +39,7 @@
     @endif
 </form>
 
-{{-- 📄 TABLEAU --}}
+{{--  TABLEAU --}}
 <table>
     <thead>
         <tr>
@@ -78,7 +78,7 @@
     </tbody>
 </table>
 
-{{-- 🔁 PAGINATION --}}
+{{--  PAGINATION --}}
 <div style="margin-top:15px;">
     {{ $sources->links() }}
 </div>
